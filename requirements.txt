@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+openpyxl
+msal
+Office365-REST-Python-Client
+sqlalchemy
+pyodbc
+python-dotenv
+requests
