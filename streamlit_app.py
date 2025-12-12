@@ -263,46 +263,66 @@ def extract_all_dsr_blocks(body_html):
 # -------------------------
 # WSR parsing
 # -------------------------
-def is_valid_wsr_subject(subject):
+def is_valid_wsr_subject(subject: str) -> bool:
     if not subject:
         return False
-    s = subject.lower().strip()
-    return s.startswith("wsr -") or s.startswith("weekly status report -")
 
-def extract_wsr_project(subject):
+    s = subject.lower().strip()
+
+    # Normalize dashes
+    s = s.replace("–", "-").replace("—", "-")
+
+    # Remove prefixes like "Re:", "Fw:", "Fwd:"
+    s = re.sub(r'^(re|fw|fwd)\s*:\s*', '', s).strip()
+
+    return (
+        "wsr -" in s or
+        "wsr-" in s or
+        "weekly status report" in s
+    )
+
+def extract_wsr_project(subject: str):
     if not subject:
         return None
-    s = subject.replace("–", "-").replace("—", "-")
-    parts = s.split("-")
-    if len(parts) >= 2:
-        return parts[1].strip()
-    return None
 
-def extract_wsr_date_range(body_html):
-    text = re.sub(r"<[^>]+>", " ", body_html or "")
-    m = re.search(r'from\s+([0-9A-Za-z ,/.-]+?)\s+to\s+([0-9A-Za-z ,/.-]+?\d{2,4})', text, flags=re.I)
+    s = subject.replace("–", "-").replace("—", "-").strip()
+    s = re.sub(r'^(re|fw|fwd)\s*:\s*', '', s, flags=re.I).strip()
+
+    # Expected formats:
+    # WSR - Project
+    # Weekly Status Report - Project
+    parts = s.split("-", maxsplit=1)
+    if len(parts) < 2:
+        return None
+
+    project = parts[1].strip()
+    return project if project else None
+
+def extract_wsr_date_range(body_html: str):
+    if not body_html:
+        return (None, None)
+
+    # Clean HTML → plain text
+    text = re.sub(r"<[^>]+>", " ", body_html)
+    text = re.sub(r"\s+", " ", text)
+
+    # Pattern 1: "from X to Y"
+    m = re.search(r'from\s+(.+?)\s+to\s+(.+?\d{2,4})', text, flags=re.I)
     if m:
-        a = parse_date_string(m.group(1))
-        b = parse_date_string(m.group(2))
-        if a and b:
-            return a, b
-    m2 = re.search(r'([0-9]{1,2}[^\w]{1,3}[A-Za-z0-9]{1,20}[^\w]{0,3}\d{2,4})\s*[-–]\s*([0-9]{1,2}[^\w]{1,3}[A-Za-z0-9]{1,20}[^\w]{0,3}\d{2,4})', text)
+        s1 = parse_date_string(m.group(1))
+        s2 = parse_date_string(m.group(2))
+        if s1 and s2:
+            return s1, s2
+
+    # Pattern 2: "X - Y"
+    m2 = re.search(r'(.+?\d{2,4})\s*[-–]\s*(.+?\d{2,4})', text)
     if m2:
-        a = parse_date_string(m2.group(1))
-        b = parse_date_string(m2.group(2))
-        if a and b:
-            return a, b
-    ds = extract_date_strings(text)
-    parsed = []
-    for s in ds:
-        d = parse_date_string(s)
-        if d:
-            parsed.append(d)
-        if len(parsed) >= 2:
-            break
-    if len(parsed) == 2:
-        return parsed[0], parsed[1]
-    return None, None
+        s1 = parse_date_string(m2.group(1))
+        s2 = parse_date_string(m2.group(2))
+        if s1 and s2:
+            return s1, s2
+
+    return (None, None)
 
 # -------------------------
 # Excel helpers
@@ -555,20 +575,26 @@ def parse_inbox_messages_for_preview(messages, processed_ids):
                 "date": blk.get("date")
             })
         # WSR
+        # ---- Improved WSR detection ----
+        # Attachment is compulsory
         if is_valid_wsr_subject(subj) and has_attach:
+
             project = extract_wsr_project(subj)
             start, end = extract_wsr_date_range(body)
+
+            # MUST find project + start + end dates
             if project and start and end:
                 wsr_parsed.append({
                     "message_id": msg_id,
-                    "from": (m.get("from") or {}).get("emailAddress", {}).get("address",""),
+                    "from": (m.get("from") or {}).get("emailAddress", {}).get("address", ""),
                     "subject": subj,
                     "project": project,
                     "start_date": start,
                     "end_date": end,
-                    "date": start,
+                    "date": start,     # representative week date
                     "hasAttachment": True
                 })
+
     return dsr_parsed, wsr_parsed
 
 # -------------------------
