@@ -30,8 +30,8 @@ LOCAL_DSR_TEMPLATE = "/mnt/data/DSR_tracker.xlsx"   # optional - can be absent
 LOCAL_WSR_TEMPLATE = "/mnt/data/WSR_tracker.xlsx"   # optional - can be absent
 
 # Name of files stored in OneDrive root
-ONEDRIVE_DSR_FILENAME = "DSR.xlsx"
-ONEDRIVE_WSR_FILENAME = "WSR.xlsx"
+ONEDRIVE_DSR_FILENAME = "DSR_tracker_updated.xlsx"
+ONEDRIVE_WSR_FILENAME = "WSR_tracker_updated.xlsx"
 PROCESSED_JSON_NAME = "processed_messages.json"
 
 # Styling
@@ -195,69 +195,415 @@ def extract_date_strings(text):
                 matches.append(m.group(2))
     return matches
 
+# def parse_date_string(s):
+#     if not s:
+#         return None
+#     s = str(s).strip().strip("<>").replace(".", " ").replace(",", " ")
+#     try:
+#         d = dateutil_parser.parse(s, dayfirst=False, fuzzy=True).date()
+#         return d
+#     except Exception:
+#         pass
+#     fmts = ["%d %B %Y","%d %b %Y","%Y-%m-%d","%d-%m-%Y","%d/%m/%Y","%d/%m/%y","%B %d %Y","%b %d %Y"]
+#     for f in fmts:
+#         try:
+#             return datetime.strptime(s, f).date()
+#         except Exception:
+#             continue
+#     return None
+
 def parse_date_string(s):
+    """
+    Parse date string with DD-MM-YYYY priority for numeric dates
+    Handles: 13-11-2025, 05/12/2025, etc.
+    """
     if not s:
         return None
+    
+    # Clean up the string
     s = str(s).strip().strip("<>").replace(".", " ").replace(",", " ")
+    s = re.sub(r'\s+', ' ', s)  # Normalize whitespace
+    
+    # Pattern 1: DD-MM-YYYY or DD/MM/YYYY (PRIORITY - Indian format)
+    # Matches: 13-11-2025, 14-11-2025, 05/12/2025, 04/12/2025
+    match = re.match(r'^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$', s)
+    if match:
+        day, month, year = match.groups()
+        day, month = int(day), int(month)
+        year = int(year)
+        
+        # Handle 2-digit years
+        if year < 100:
+            year += 2000 if year < 50 else 1900
+        
+        # ALWAYS interpret as DD-MM-YYYY first
+        # Only if day > 31 or month validation fails, try MM-DD-YYYY
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            try:
+                return date(year, month, day)
+            except ValueError:
+                # Day is invalid for this month, try swapping
+                if 1 <= month <= 31 and 1 <= day <= 12:
+                    try:
+                        return date(year, day, month)  # Try MM-DD-YYYY
+                    except ValueError:
+                        pass
+        elif 1 <= month <= 31 and 1 <= day <= 12:
+            # Day > 12, so must be MM-DD-YYYY
+            try:
+                return date(year, day, month)
+            except ValueError:
+                pass
+    
+    # Pattern 2: DD Month YYYY (e.g., "13 Dec 2025", "14 November 2025")
+    month_names = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+    match = re.match(rf'^(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\s+(\d{{4}})$', s, re.IGNORECASE)
+    if match:
+        try:
+            return datetime.strptime(f"{match.group(1)} {match.group(2)} {match.group(3)}", "%d %B %Y").date()
+        except ValueError:
+            try:
+                return datetime.strptime(f"{match.group(1)} {match.group(2)} {match.group(3)}", "%d %b %Y").date()
+            except ValueError:
+                pass
+    
+    # Pattern 3: Month DD, YYYY (e.g., "December 4, 2025")
+    match = re.match(rf'^({month_names})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})$', s, re.IGNORECASE)
+    if match:
+        try:
+            return datetime.strptime(f"{match.group(2)} {match.group(1)} {match.group(3)}", "%d %B %Y").date()
+        except ValueError:
+            try:
+                return datetime.strptime(f"{match.group(2)} {match.group(1)} {match.group(3)}", "%d %b %Y").date()
+            except ValueError:
+                pass
+    
+    # Pattern 4: YYYY-MM-DD (ISO format)
+    match = re.match(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$', s)
+    if match:
+        year, month, day = match.groups()
+        try:
+            return date(int(year), int(month), int(day))
+        except ValueError:
+            pass
+    
+    # Fallback: Try dateutil parser with dayfirst=True
     try:
-        d = dateutil_parser.parse(s, dayfirst=False, fuzzy=True).date()
+        d = dateutil_parser.parse(s, dayfirst=True, fuzzy=True).date()
         return d
     except Exception:
         pass
-    fmts = ["%d %B %Y","%d %b %Y","%Y-%m-%d","%d-%m-%Y","%d/%m/%Y","%d/%m/%y","%B %d %Y","%b %d %Y"]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f).date()
-        except Exception:
-            continue
+    
     return None
+
+def is_valid_dsr_subject(subject):
+    """
+    Check if subject line indicates this is a DSR email
+    Returns True for subjects containing "DSR" or "Daily Status Report"
+    """
+    if not subject:
+        return False
+    
+    s = subject.lower().strip()
+    
+    # Normalize dashes
+    s = s.replace("–", "-").replace("—", "-")
+    
+    # Remove prefixes like "Re:", "Fw:", "Fwd:"
+    s = re.sub(r'^(re|fw|fwd)\s*:\s*', '', s).strip()
+    
+    # Check for DSR or Daily Status Report
+    return (
+        "dsr" in s or
+        "daily status report" in s or
+        s.startswith("daily status report")
+    )
+
+
+# UPDATE the extract_from_subject function to support both DSR and "Daily Status Report"
+
+def extract_from_subject(subject):
+    """
+    Extract Resource and Project from subject
+    Supports formats:
+    - Daily Status Report - Resource Name - Project Name
+    - DSR - Resource Name - Project Name
+    - Daily Status Report: Resource Name - Project Name
+    """
+    if not subject:
+        return None, None
+    
+    subj = subject.strip()
+    subj = re.sub(r'^(re|fw|fwd)\s*:\s*', '', subj, flags=re.I).strip()
+    
+    # Pattern: DSR/Daily Status Report - Resource - Project
+    pattern = r'(?:Daily\s+Status\s+Report|DSR)\s*[-:]\s*([^-]+?)\s*[-]\s*(.+)'
+    match = re.search(pattern, subj, re.IGNORECASE)
+    
+    if match:
+        resource = match.group(1).strip()
+        project = match.group(2).strip()
+        return resource, project
+    
+    return None, None
+
+def auto_detect_dates_comprehensive(text):
+    """
+    Comprehensive date detection from any part of email body.
+    Scans the entire text for date patterns.
+    """
+    if not text:
+        return []
+    
+    all_dates = []
+    
+    # Clean HTML and normalize text
+    clean_text = re.sub(r'<[^>]+>', ' ', text)
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    
+    # Method 1: Use extract_multiple_dates_from_text (handles ranges and separators)
+    dates_method1 = extract_multiple_dates_from_text(clean_text)
+    all_dates.extend(dates_method1)
+    
+    # Method 2: Scan entire text for any date-like patterns
+    comprehensive_patterns = [
+        # DD-Mon-YYYY or DD/Mon/YYYY (most common in DSR)
+        r'(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{4})',
+        # DD Month YYYY with optional ordinals
+        r'(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\s+\d{4})',
+        # Month DD, YYYY
+        r'([A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})',
+        # DD-MM-YYYY or DD/MM/YYYY
+        r'(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
+        # YYYY-MM-DD
+        r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+    ]
+    
+    for pattern in comprehensive_patterns:
+        matches = re.finditer(pattern, clean_text, re.IGNORECASE)
+        for match in matches:
+            date_str = match.group(1)
+            parsed = parse_date_string(date_str)
+            
+            if parsed and parsed not in all_dates:
+                all_dates.append(parsed)
+    
+    # Sort and return (removed strict date range validation)
+    return sorted(list(set(all_dates)))
+
+def extract_multiple_dates_from_text(text):
+    """
+    Extract multiple dates supporting ranges with DD-MM-YYYY priority
+    Handles:
+    - 13-11-2025 to 14-11-2025
+    - 13 Dec 2025 - 16 Dec 2025
+    - 05/12/2025, 06/12/2025
+    """
+    if not text:
+        return []
+    
+    dates = []
+    
+    # Pattern 1: Date ranges with DD-MM-YYYY or DD/MM/YYYY format
+    # Matches: "13-11-2025 to 14-11-2025" or "05/12/2025-06/12/2025"
+    numeric_range_pattern = r'(\d{1,2}[-/]\d{1,2}[-/]\d{4})\s*(?:to|-|–)\s*(\d{1,2}[-/]\d{1,2}[-/]\d{4})'
+    numeric_ranges = re.findall(numeric_range_pattern, text, re.IGNORECASE)
+    
+    for start_str, end_str in numeric_ranges:
+        start_date = parse_date_string(start_str)
+        end_date = parse_date_string(end_str)
+        
+        if start_date and end_date:
+            current = start_date
+            while current <= end_date:
+                if current not in dates:
+                    dates.append(current)
+                current += timedelta(days=1)
+    
+    # Pattern 2: Date ranges with text months
+    # Matches: "13 Dec 2025 to 16 Dec 2025"
+    text_range_pattern = r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\s*(?:to|-|–)\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})'
+    text_ranges = re.findall(text_range_pattern, text, re.IGNORECASE)
+    
+    for start_str, end_str in text_ranges:
+        start_date = parse_date_string(start_str)
+        end_date = parse_date_string(end_str)
+        
+        if start_date and end_date:
+            current = start_date
+            while current <= end_date:
+                if current not in dates:
+                    dates.append(current)
+                current += timedelta(days=1)
+    
+    # Remove the range text to avoid double-processing
+    text_without_ranges = re.sub(numeric_range_pattern, '', text, flags=re.IGNORECASE)
+    text_without_ranges = re.sub(text_range_pattern, '', text_without_ranges, flags=re.IGNORECASE)
+    
+    # Pattern 3: Individual dates separated by commas, 'and', '&'
+    date_parts = re.split(r'[,&]|\s+and\s+', text_without_ranges, flags=re.IGNORECASE)
+    
+    for part in date_parts:
+        # Find all date patterns in this part
+        date_patterns = [
+            r'(\d{1,2}[-/]\d{1,2}[-/]\d{4})',      # 13-11-2025 or 05/12/2025
+            r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',  # 13 Dec 2025
+            r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})',      # 2025-12-05
+        ]
+        
+        for pattern in date_patterns:
+            matches = re.findall(pattern, part, re.IGNORECASE)
+            for match in matches:
+                parsed = parse_date_string(match)
+                if parsed and parsed not in dates:
+                    dates.append(parsed)
+    
+    return sorted(list(set(dates)))
 
 # -------------------------
 # DSR extraction from threads
 # -------------------------
-def extract_all_dsr_blocks(body_html):
+def extract_all_dsr_blocks(body_html, subject=None, message=None):
+    """
+    Extract DSR entries from email body with enhanced logic:
+    1. Try to extract from subject first
+    2. Extract dates from body ONLY
+    3. Always include sender email
+    """
     text = re.sub(r"<[^>]+>", "\n", body_html or "")
+    sender_email = get_sender_email_from_message(message)
+
+    
+    # Try to extract from subject first
+    subject_resource, subject_project = extract_from_subject(subject)
+    
+    # AUTO-DETECT dates from entire email body
+    body_dates = auto_detect_dates_comprehensive(body_html or "")
+    
+    # If subject has both resource and project, create entries for all detected dates
+    if subject_resource and subject_project and body_dates:
+        entries = []
+        for dt in body_dates:
+            entries.append({
+                "project": subject_project,
+                "resource": subject_resource,
+                "date": dt,
+                "email": sender_email or ""
+            })
+        return entries
+    
+    # Parse DSR blocks from body
     splits = re.split(r"(?i)Daily Status Report", text)
     entries = []
+    
     if len(splits) <= 1:
+        # No DSR blocks found, but if we have subject info and dates, create entries anyway
+        if subject_resource and subject_project and body_dates:
+            for dt in body_dates:
+                entries.append({
+                    "project": subject_project,
+                    "resource": subject_resource,
+                    "date": dt,
+                    "email": sender_email or ""
+                })
         return entries
+    
     for s in splits[1:]:
         blk = "Daily Status Report " + s
-        # date heuristics
-        date_match = re.search(r"Daily Status Report.*?(\d{1,2}[^A-Za-z0-9\n]{0,2}\s*[A-Za-z0-9,\-\/\s]+?\d{4})", blk, flags=re.I)
-        raw_date = None
-        if date_match:
-            raw_date = date_match.group(1)
-        else:
-            dm = re.search(r"for\s*[:\-]?\s*<?([\dA-Za-z\-/\s,]+?\d{2,4})>", blk, flags=re.I)
-            if dm:
-                raw_date = dm.group(1)
-        parsed_date = parse_date_string(raw_date) if raw_date else None
+        
+        # Extract date from this specific block
+        parsed_date = None
+        
+        # Strategy 1: Look for date in table header
+        header_dates = []
+
+        header_match = re.search(
+            r"Daily Status Report\s+(?:for\s+)?(.+)",
+            blk, flags=re.IGNORECASE
+        )
+
+        if header_match:
+            header_text = header_match.group(1)
+
+            # Extract ALL date-like strings from header
+            raw_dates = re.findall(
+                r"\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{4}|\d{1,2}[-/]\d{1,2}[-/]\d{4}",
+                header_text
+            )
+
+            for rd in raw_dates:
+                dt = parse_date_string(rd)
+                if dt:
+                    header_dates.append(dt)
+        
+        # Strategy 2: Look in first few lines for any date pattern
         if not parsed_date:
-            ds = extract_date_strings(blk)
-            for sdate in ds:
-                d = parse_date_string(sdate)
-                if d:
-                    parsed_date = d
+            lines = blk.split('\n')[:5]
+            for line in lines:
+                # Try multiple patterns
+                for pattern in [
+                    r'(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{4})',
+                    r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+                    r'(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
+                ]:
+                    match = re.search(pattern, line)
+                    if match:
+                        parsed_date = parse_date_string(match.group(1))
+                        if parsed_date:
+                            break
+                if parsed_date:
                     break
-        if not parsed_date:
-            continue
-        # project
-        project = None
-        mproj = re.search(r"Project\s*Name[:\s\-]+(.+)", blk, flags=re.I)
-        if mproj:
-            project = mproj.group(1).splitlines()[0].strip()
-        else:
-            lines = [ln.strip() for ln in blk.splitlines() if ln.strip()]
-            if len(lines) >= 2:
-                project = lines[1]
-        # resource
-        resource = None
-        mres = re.search(r"Resource\s*Name[:\s\-]+(.+)", blk, flags=re.I)
-        if mres:
-            resource = mres.group(1).splitlines()[0].strip()
-        if project and resource:
-            entries.append({"project": project, "resource": resource, "date": parsed_date})
+        
+        # Strategy 3: Use auto-detected dates from body as fallback
+        if not parsed_date and body_dates:
+            parsed_date = body_dates[0]
+        
+        # Extract project
+        project = subject_project  # Use from subject if available
+        if not project:
+            mproj = re.search(r"Project\s*Name[:\s\-]+(.+)", blk, flags=re.I)
+            if mproj:
+                project = mproj.group(1).splitlines()[0].strip()
+            else:
+                lines = [ln.strip() for ln in blk.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    project = lines[1]
+        
+        # Extract resource
+        resource = subject_resource  # Use from subject if available
+        if not resource:
+            mres = re.search(r"Resource\s*Name[:\s\-]+(.+)", blk, flags=re.I)
+            if mres:
+                resource = mres.group(1).splitlines()[0].strip()
+        
+        # Clean project and resource (remove HTML entities)
+        if project:
+            project = project.strip()
+            project = re.sub(r'&[a-z]+;', '', project)  # Remove &nbsp; etc.
+            project = re.sub(r'\s+', ' ', project).strip()
+            if not project:
+                project = None
+        
+        if resource:
+            resource = resource.strip()
+            resource = re.sub(r'&[a-z]+;', '', resource)
+            resource = re.sub(r'\s+', ' ', resource).strip()
+            if not resource:
+                resource = None
+        
+        # Only add if ALL three are present: project, resource, AND date
+        dates_to_use = header_dates or ([parsed_date] if parsed_date else [])
+
+        for dt in dates_to_use:
+            if resource and dt:
+                entries.append({
+                    "project": project,
+                    "resource": resource,
+                    "date": dt,
+                    "email": sender_email or ""
+                })
+
+    
     return entries
 
 # -------------------------
@@ -331,58 +677,114 @@ def month_sheet_name(d: date):
     return d.strftime("%B %Y")
 
 def ensure_month_sheet_and_days(wb, target_date: date):
+    """
+    Ensure month sheet exists with ALL days of the month pre-populated
+    """
     sheet_name = month_sheet_name(target_date)
+    
     if sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
     else:
         ws = wb.create_sheet(sheet_name)
+        # Set up headers
         ws.cell(row=1, column=1, value="Project Name")
         ws.cell(row=1, column=2, value="Resource Name")
-    year = target_date.year; month = target_date.month
+        ws.cell(row=1, column=3, value="Email")
+    
+    # Get year and month
+    year = target_date.year
+    month = target_date.month
     num_days = monthrange(year, month)[1]
+    
+    # Build map of existing date columns
     existing = {}
     for c in range(1, ws.max_column + 1):
         val = ws.cell(row=1, column=c).value
         if val:
             existing[str(val).strip()] = c
-    for day in range(1, num_days+1):
+    
+    # ENSURE ALL DAYS OF THE MONTH ARE PRESENT
+    for day in range(1, num_days + 1):
         dt = date(year, month, day)
         label = dt.strftime("%d %B %Y")
+        
         if label not in existing:
+            # Add new column for this date
             col = ws.max_column + 1
             ws.cell(row=1, column=col, value=label)
-            ws.cell(row=2, column=col, value=dt.strftime("%A"))
+            ws.cell(row=2, column=col, value=dt.strftime("%A"))  # Day name
             existing[label] = col
+    
     return ws, existing
+
 
 def week_label_for_date(d: date):
     monday = d - timedelta(days=d.weekday())
     friday = monday + timedelta(days=4)
     return f"{monday.strftime('%d %b %Y')} - {friday.strftime('%d %b %Y')}"
 
-def ensure_month_sheet_and_weeks(wb, any_date: date):
-    sheet_name = month_sheet_name(any_date)
+def ensure_month_sheet_and_days(wb, target_date: date):
+    """
+    Ensure month sheet exists with ALL days of the month pre-populated in ORDER
+    Creates columns for every day from 1st to last day of month
+    """
+    sheet_name = month_sheet_name(target_date)
+    
     if sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
     else:
         ws = wb.create_sheet(sheet_name)
+        # Set up fixed headers
         ws.cell(row=1, column=1, value="Project Name")
-    year = any_date.year; month = any_date.month
-    first = date(year, month, 1)
-    last = date(year, month, monthrange(year, month)[1])
-    start_monday = first - timedelta(days=first.weekday())
-    curr = start_monday
-    existing = { (ws.cell(row=1, column=c).value or "").strip(): c for c in range(1, ws.max_column+1) }
-    while curr <= last:
-        mono = curr
-        fri = mono + timedelta(days=4)
-        label = f"{mono.strftime('%d %b %Y')} - {fri.strftime('%d %b %Y')}"
-        if label not in existing:
-            col = ws.max_column + 1
-            ws.cell(row=1, column=col, value=label)
-            existing[label] = col
-        curr += timedelta(days=7)
-    return ws, existing
+        ws.cell(row=1, column=2, value="Resource Name")
+        ws.cell(row=1, column=3, value="Email")
+    
+    # Get year and month
+    year = target_date.year
+    month = target_date.month
+    num_days = monthrange(year, month)[1]
+    
+    # Build map of existing date columns
+    existing_dates = {}
+    for c in range(4, ws.max_column + 1):  # Start from column 4 (after Email)
+        val = ws.cell(row=1, column=c).value
+        if val:
+            # Try to extract date from column header
+            date_match = re.search(r'(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})', str(val))
+            if date_match:
+                try:
+                    parsed = parse_date_string(val)
+                    if parsed:
+                        existing_dates[parsed.day] = c
+                except:
+                    pass
+    
+    # ENSURE ALL DAYS OF THE MONTH ARE PRESENT IN ORDER
+    # Start from column 4 (after Project, Resource, Email)
+    next_col = 4
+    
+    for day in range(1, num_days + 1):
+        dt = date(year, month, day)
+        label = dt.strftime("%d %B %Y")  # e.g., "01 December 2025"
+        day_name = dt.strftime("%A")      # e.g., "Monday"
+        
+        if day not in existing_dates:
+            # Add new column for this date at the correct position
+            ws.cell(row=1, column=next_col, value=label)
+            ws.cell(row=2, column=next_col, value=day_name)
+            existing_dates[day] = next_col
+        
+        next_col += 1
+    
+    # Build a mapping of date labels to columns for easy lookup
+    date_col_map = {}
+    for c in range(4, ws.max_column + 1):
+        val = ws.cell(row=1, column=c).value
+        if val:
+            date_col_map[str(val).strip()] = c
+    
+    return ws, date_col_map
+
 
 def find_week_column_for_date(ws, target_date):
     for c in range(2, ws.max_column+1):
@@ -428,39 +830,161 @@ def style_workbook_headers_and_ys(wb):
                     cell.fill = Y_FILL
                     cell.alignment = CENTER_ALIGN
 
+
+def ensure_month_sheet_and_weeks(wb, any_date: date):
+    sheet_name = month_sheet_name(any_date)
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+    else:
+        ws = wb.create_sheet(sheet_name)
+        ws.cell(row=1, column=1, value="Project Name")
+    year = any_date.year; month = any_date.month
+    first = date(year, month, 1)
+    last = date(year, month, monthrange(year, month)[1])
+    start_monday = first - timedelta(days=first.weekday())
+    curr = start_monday
+    existing = { (ws.cell(row=1, column=c).value or "").strip(): c for c in range(1, ws.max_column+1) }
+    while curr <= last:
+        mono = curr
+        fri = mono + timedelta(days=4)
+        label = f"{mono.strftime('%d %b %Y')} - {fri.strftime('%d %b %Y')}"
+        if label not in existing:
+            col = ws.max_column + 1
+            ws.cell(row=1, column=col, value=label)
+            existing[label] = col
+        curr += timedelta(days=7)
+    return ws, existing
+
+
+
+
 # -------------------------
 # Workbook updates
 # -------------------------
 def update_dsr_wb_bytes(wb, dsr_records):
-    processed = 0; duplicates = 0
+    """
+    Update DSR workbook with email column
+    Ensures all days of the month are pre-populated before marking attendance
+    """
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from io import BytesIO
+    from collections import defaultdict
+    
+    HEADER_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    Y_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    HEADER_FONT = Font(bold=True)
+    CENTER_ALIGN = Alignment(horizontal="center", vertical="center")
+    THIN_BORDER = Border(left=Side(style="thin"), right=Side(style="thin"),
+                         top=Side(style="thin"), bottom=Side(style="thin"))
+    
+    processed = 0
+    duplicates = 0
+    
+    # Group records by month to ensure all days are populated
+    records_by_month = defaultdict(list)
     for rec in dsr_records:
-        d = rec["date"]
-        ws, headers = ensure_month_sheet_and_days(wb, d)
-        project = rec["project"]; resource = rec["resource"]
-        date_label = d.strftime("%d %B %Y")
-        col_idx = headers.get(date_label)
-        if not col_idx:
-            col_idx = ws.max_column + 1
-            ws.cell(row=1, column=col_idx, value=date_label)
-        # find/create row
-        row_idx = None
-        for r in range(3, ws.max_row+1):
-            if ws.cell(row=r, column=1).value == project and ws.cell(row=r, column=2).value == resource:
-                row_idx = r; break
-        if not row_idx:
-            row_idx = ws.max_row + 1
-            if row_idx < 3: row_idx = 3
-            ws.cell(row=row_idx, column=1, value=project)
-            ws.cell(row=row_idx, column=2, value=resource)
-        if ws.cell(row=row_idx, column=col_idx).value == "Y":
-            duplicates += 1
-        else:
-            ws.cell(row=row_idx, column=col_idx, value="Y")
-            processed += 1
-    style_workbook_headers_and_ys(wb)
-    for s in wb.sheetnames:
-        auto_fit_column_width(wb[s])
-    bio = BytesIO(); wb.save(bio); return bio.getvalue(), processed, duplicates
+        d = rec.get("date")
+        if d:
+            month_key = (d.year, d.month)
+            records_by_month[month_key].append(rec)
+    
+    # Process each month
+    for (year, month), month_records in records_by_month.items():
+        # Use any date from this month to ensure the sheet exists
+        sample_date = date(year, month, 1)
+        
+        # Ensure month sheet exists with ALL days pre-populated
+        ws, date_col_map = ensure_month_sheet_and_days(wb, sample_date)
+        
+        # Now process each record
+        for rec in month_records:
+            d = rec.get("date")
+            project = rec.get("project", "")
+            resource = rec.get("resource", "")
+            email = rec.get("email", "")
+            
+            # Find date column
+            date_label = d.strftime("%d %B %Y")
+            date_col = date_col_map.get(date_label)
+            
+            if not date_col:
+                st.warning(f"Could not find column for date {date_label}")
+                continue
+            
+            # Find or create row for this project/resource/email combination
+            row_idx = None
+            for r in range(3, ws.max_row + 1):
+                row_proj = ws.cell(row=r, column=1).value or ""
+                row_res = ws.cell(row=r, column=2).value or ""
+                row_email = ws.cell(row=r, column=3).value or ""
+                
+                if (row_proj == project and row_res == resource and row_email == email):
+                    row_idx = r
+                    break
+            
+            if not row_idx:
+                # Create new row
+                row_idx = ws.max_row + 1
+                if row_idx < 3:
+                    row_idx = 3
+                ws.cell(row=row_idx, column=1, value=project)
+                ws.cell(row=row_idx, column=2, value=resource)
+                ws.cell(row=row_idx, column=3, value=email)
+            
+            # Mark attendance
+            if ws.cell(row=row_idx, column=date_col).value == "Y":
+                duplicates += 1
+            else:
+                ws.cell(row=row_idx, column=date_col, value="Y")
+                processed += 1
+    
+    # Style the workbook
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        
+        # Header row styling (row 1)
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = CENTER_ALIGN
+            cell.border = THIN_BORDER
+        
+        # Day name row styling (row 2)
+        for c in range(4, ws.max_column + 1):
+            cell = ws.cell(row=2, column=c)
+            cell.alignment = CENTER_ALIGN
+            cell.border = THIN_BORDER
+        
+        # Style "Y" cells
+        for r in range(3, ws.max_row + 1):
+            for c in range(4, ws.max_column + 1):  # Start after email column
+                cell = ws.cell(row=r, column=c)
+                cell.border = THIN_BORDER
+                if cell.value == "Y":
+                    cell.fill = Y_FILL
+                    cell.alignment = CENTER_ALIGN
+        
+        # Auto-fit columns
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    val = "" if cell.value is None else str(cell.value)
+                    if len(val) > max_len:
+                        max_len = len(val)
+                except Exception:
+                    pass
+            adjusted_width = max(max_len + 2, 12)  # Minimum width of 12
+            ws.column_dimensions[col_letter].width = adjusted_width
+    
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue(), processed, duplicates
+
+
+
 
 def update_wsr_wb_bytes(wb, wsr_records):
     processed = 0; duplicates = 0
@@ -499,19 +1023,41 @@ def update_wsr_wb_bytes(wb, wsr_records):
 # Minimal template creators (guaranteed)
 # -------------------------
 def make_minimal_dsr_bytes():
+    """
+    Create a minimal DSR workbook with proper structure
+    Includes a sample month with all days pre-populated
+    """
     wb = Workbook()
     ws = wb.active
-    ws.title = "Summary"
-    ws.append(["Project Name", "Resource Name"])
-    bio = BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
-
-def make_minimal_wsr_bytes():
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Summary"
-    ws.append(["Project Name"])
+    
+    # Create a sample sheet for current month
+    today = date.today()
+    ws.title = today.strftime("%B %Y")
+    
+    # Headers
+    ws.cell(row=1, column=1, value="Project Name")
+    ws.cell(row=1, column=2, value="Resource Name")
+    ws.cell(row=1, column=3, value="Email")
+    
+    # Add all days of current month
+    year = today.year
+    month = today.month
+    num_days = monthrange(year, month)[1]
+    
+    for day in range(1, num_days + 1):
+        dt = date(year, month, day)
+        col = 3 + day  # Start from column 4
+        ws.cell(row=1, column=col, value=dt.strftime("%d %B %Y"))
+        ws.cell(row=2, column=col, value=dt.strftime("%A"))
+    
+    # Apply styling to headers
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = CENTER_ALIGN
+        cell.border = THIN_BORDER
+    
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
@@ -550,35 +1096,54 @@ def ensure_onedrive_file(token, filename, local_template=None, minimal_fn=None):
     meta = create_onedrive_file_from_bytes(token, filename, b)
     return meta.get("id"), meta.get("webUrl")
 
+
+def get_sender_email_from_message(m):
+    if not m:
+        return ""
+    return (
+        (m.get("from") or {}).get("emailAddress", {}).get("address")
+        or (m.get("sender") or {}).get("emailAddress", {}).get("address")
+        or (m.get("replyTo") or [{}])[0].get("emailAddress", {}).get("address")
+        or ""
+    )
+
+
+
 # -------------------------
 # Preview parsing (exclude processed messages)
 # -------------------------
 def parse_inbox_messages_for_preview(messages, processed_ids):
     dsr_parsed = []
     wsr_parsed = []
+    
     for m in messages:
         msg_id = m.get("id")
         if msg_id in processed_ids:
             continue
+            
         subj = m.get("subject","") or ""
         body = (m.get("body") or {}).get("content","") or ""
         has_attach = m.get("hasAttachments", False)
-        # DSR blocks
-        dsr_blocks = extract_all_dsr_blocks(body)
-        for blk in dsr_blocks:
-            dsr_parsed.append({
-                "message_id": msg_id,
-                "from": (m.get("from") or {}).get("emailAddress", {}).get("address",""),
-                "subject": subj,
-                "project": blk.get("project"),
-                "resource": blk.get("resource"),
-                "date": blk.get("date")
-            })
-        # WSR
-        # ---- Improved WSR detection ----
+        sender_email = (m.get("from") or {}).get("emailAddress", {}).get("address","")
+        
+        # ===== DSR PROCESSING WITH SUBJECT FILTER =====
+        # Only process emails with DSR-related subjects
+        if is_valid_dsr_subject(subj):
+            dsr_blocks = extract_all_dsr_blocks(body, subject=subj, message=m)
+            
+            for blk in dsr_blocks:
+                dsr_parsed.append({
+                    "message_id": msg_id,
+                    "email": blk.get("email"),
+                    "subject": subj,
+                    "project": blk.get("project"),
+                    "resource": blk.get("resource"),
+                    "date": blk.get("date")
+                })
+        
+        # ===== WSR PROCESSING =====
         # Attachment is compulsory
         if is_valid_wsr_subject(subj) and has_attach:
-
             project = extract_wsr_project(subj)
             start, end = extract_wsr_date_range(body)
 
@@ -586,7 +1151,7 @@ def parse_inbox_messages_for_preview(messages, processed_ids):
             if project and start and end:
                 wsr_parsed.append({
                     "message_id": msg_id,
-                    "from": (m.get("from") or {}).get("emailAddress", {}).get("address", ""),
+                    "from": sender_email,
                     "subject": subj,
                     "project": project,
                     "start_date": start,
@@ -596,7 +1161,6 @@ def parse_inbox_messages_for_preview(messages, processed_ids):
                 })
 
     return dsr_parsed, wsr_parsed
-
 # -------------------------
 # UI
 # -------------------------
@@ -655,6 +1219,18 @@ with col1:
 
             try:
                 msgs = get_inbox_messages(access_token, top=300)
+        
+                # # DEBUG: Check first message
+                # if msgs:
+                #     st.write("**DEBUG: First message**")
+                #     first_msg = msgs[0]
+                #     st.write("Subject:", first_msg.get("subject"))
+                #     body = (first_msg.get("body") or {}).get("content", "")
+                #     st.write("Body preview:", body[:500])
+                    
+                #     # Test date extraction
+                #     dates_found = auto_detect_dates_comprehensive(body)
+                #     st.write("Dates auto-detected:", dates_found)
             except Exception as e:
                 st.error(f"Failed fetching inbox: {e}")
                 st.stop()
@@ -684,12 +1260,13 @@ with col1:
                 mid = row.get("message_id")
                 if mid in processed_ids:
                     continue
-                proj = row.get("project"); res = row.get("resource"); dt_raw = row.get("date")
+                proj = row.get("project", " "); res = row.get("resource"); dt_raw = row.get("date")
                 dt = parse_date_string(dt_raw) if isinstance(dt_raw, str) else None
-                if not (proj and res and dt):
+                if not (res and dt):
                     st.warning(f"Skipping row {i} - missing fields")
                     continue
-                dsr_records.append({"project": proj, "resource": res, "date": dt, "message_id": mid})
+                dsr_records.append({"project": proj, "resource": res, "date": dt, "message_id": mid, "email": row.get("email", ""),   # ⭐ FIX
+})
 
             if not dsr_records:
                 st.info("No valid DSR rows to process.")
